@@ -25,6 +25,7 @@ const KEYWORDS = new Set([
 	'KEY',
 	'NOT',
 	'NULL',
+	'ONLY',
 	'PRIMARY',
 	'REFERENCES',
 	'SCHEMA',

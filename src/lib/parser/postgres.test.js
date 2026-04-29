@@ -547,6 +547,46 @@ describe('parsePostgresSQL foreign keys', () => {
 		});
 	});
 
+	it('parses ALTER TABLE ONLY (pg_dump output) for primary keys and foreign keys', () => {
+		const sql = `
+      CREATE TABLE system.auth_user (id integer);
+      CREATE TABLE contract.manifest_asset (id integer, updated_by integer);
+      ALTER TABLE ONLY system.auth_user ADD CONSTRAINT auth_user_pkey PRIMARY KEY (id);
+      ALTER TABLE ONLY contract.manifest_asset ADD CONSTRAINT manifest_asset_pkey PRIMARY KEY (id);
+      ALTER TABLE ONLY "contract"."manifest_asset" ADD CONSTRAINT "manifest_asset_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "system"."auth_user" ("id") ON UPDATE NO ACTION ON DELETE NO ACTION;
+    `;
+
+		const result = parsePostgresSQL(sql);
+
+		expect(result.errors).toEqual([]);
+		expect(result.foreignKeys).toHaveLength(1);
+		expect(result.foreignKeys[0]).toEqual({
+			sourceTable: 'contract.manifest_asset',
+			sourceColumn: 'updated_by',
+			targetTable: 'system.auth_user',
+			targetColumn: 'id'
+		});
+	});
+
+	it('parses ALTER TABLE IF EXISTS ONLY combination', () => {
+		const sql = `
+      CREATE TABLE users (id integer);
+      CREATE TABLE posts (id integer, user_id integer);
+      ALTER TABLE IF EXISTS ONLY users ADD PRIMARY KEY (id);
+      ALTER TABLE IF EXISTS ONLY posts ADD FOREIGN KEY (user_id) REFERENCES users (id);
+    `;
+
+		const result = parsePostgresSQL(sql);
+
+		expect(result.foreignKeys).toHaveLength(1);
+		expect(result.foreignKeys[0]).toEqual({
+			sourceTable: 'public.posts',
+			sourceColumn: 'user_id',
+			targetTable: 'public.users',
+			targetColumn: 'id'
+		});
+	});
+
 	it('returns empty foreignKeys array when no FKs defined', () => {
 		const sql = `
       CREATE TABLE users (id integer);
@@ -924,6 +964,26 @@ ALTER TABLE public.orders ADD FOREIGN KEY (user_id) REFERENCES public.users (id)
 		expect(result.sql).not.toContain('ALTER TABLE');
 		expect(result.sql).toContain('CREATE TABLE public.users');
 		expect(result.sql).toContain('CREATE TABLE public.orders');
+	});
+
+	it('removes ALTER TABLE ONLY ADD CONSTRAINT FOREIGN KEY (pg_dump form)', () => {
+		const sql = `
+CREATE TABLE system.auth_user (id integer PRIMARY KEY);
+CREATE TABLE contract.manifest_asset (id integer PRIMARY KEY, updated_by integer);
+ALTER TABLE ONLY "contract"."manifest_asset" ADD CONSTRAINT "manifest_asset_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "system"."auth_user" ("id") ON UPDATE NO ACTION ON DELETE NO ACTION;
+`;
+
+		const fk = {
+			sourceTable: 'contract.manifest_asset',
+			sourceColumn: 'updated_by',
+			targetTable: 'system.auth_user',
+			targetColumn: 'id'
+		};
+
+		const result = removeForeignKeyStatement(sql, fk);
+		expect(result).toHaveProperty('sql');
+		expect(result.sql).not.toContain('FOREIGN KEY');
+		expect(result.sql).not.toContain('manifest_asset_updated_by_fkey');
 	});
 
 	it('removes ALTER TABLE with CONSTRAINT name', () => {
