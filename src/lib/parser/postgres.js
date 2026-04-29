@@ -543,8 +543,16 @@ function skipToNextStatement(stream) {
  * @param {ParseError[]} errors
  */
 function parseAlterTable(stream, tableMap, foreignKeys, errors) {
+	// Skip optional IF EXISTS and ONLY (e.g. ALTER TABLE IF EXISTS ONLY name)
+	stream.match('KEYWORD', 'IF');
+	stream.match('KEYWORD', 'EXISTS');
+	stream.match('KEYWORD', 'ONLY');
+
 	const { schema, name } = parseQualifiedName(stream);
 	const qualifiedName = `${schema}.${name}`;
+
+	// Skip optional trailing * (legacy "operate on inheritance descendants" syntax)
+	stream.match('OPERATOR', '*');
 
 	// Look for ADD PRIMARY KEY or ADD FOREIGN KEY
 	while (!stream.isEOF() && !stream.is('PUNCTUATION', ';')) {
@@ -701,7 +709,7 @@ export function removeForeignKeyStatement(sqlContent, fk) {
 	// First, try to find ALTER TABLE ... ADD FOREIGN KEY statement
 	// Note: target column (id) is optional in SQL - if omitted, it references the PK
 	const alterTablePattern = new RegExp(
-		`ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?${sourceTablePattern}\\s+ADD\\s+(?:CONSTRAINT\\s+[\\w"]+\\s+)?FOREIGN\\s+KEY\\s*\\(\\s*"?${escapeRegex(fk.sourceColumn)}"?\\s*\\)\\s*REFERENCES\\s+${targetTablePattern}(?:\\s*\\(\\s*"?(?:${escapeRegex(fk.targetColumn)})?"?\\s*\\))?[^;]*;`,
+		`ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:ONLY\\s+)?${sourceTablePattern}\\s+ADD\\s+(?:CONSTRAINT\\s+[\\w"]+\\s+)?FOREIGN\\s+KEY\\s*\\(\\s*"?${escapeRegex(fk.sourceColumn)}"?\\s*\\)\\s*REFERENCES\\s+${targetTablePattern}(?:\\s*\\(\\s*"?(?:${escapeRegex(fk.targetColumn)})?"?\\s*\\))?[^;]*;`,
 		'gi'
 	);
 
@@ -797,7 +805,7 @@ export function addPrimaryKeyColumn(sqlContent, tableName, columnName) {
 
 	// First, try to find existing ALTER TABLE ... ADD PRIMARY KEY
 	const alterPkPattern = new RegExp(
-		`(ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?${tablePattern}\\s+ADD\\s+(?:CONSTRAINT\\s+[\\w"]+\\s+)?PRIMARY\\s+KEY\\s*\\()([^)]+)(\\)[^;]*;)`,
+		`(ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:ONLY\\s+)?${tablePattern}\\s+ADD\\s+(?:CONSTRAINT\\s+[\\w"]+\\s+)?PRIMARY\\s+KEY\\s*\\()([^)]+)(\\)[^;]*;)`,
 		'gi'
 	);
 
@@ -883,7 +891,7 @@ export function removePrimaryKeyColumn(sqlContent, tableName, columnName) {
 
 	// First, try to find ALTER TABLE ... ADD PRIMARY KEY
 	const alterPkPattern = new RegExp(
-		`(ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?${tablePattern}\\s+ADD\\s+(?:CONSTRAINT\\s+[\\w"]+\\s+)?PRIMARY\\s+KEY\\s*\\()([^)]+)(\\)[^;]*;)`,
+		`(ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:ONLY\\s+)?${tablePattern}\\s+ADD\\s+(?:CONSTRAINT\\s+[\\w"]+\\s+)?PRIMARY\\s+KEY\\s*\\()([^)]+)(\\)[^;]*;)`,
 		'gi'
 	);
 
@@ -1028,7 +1036,7 @@ export function findOrphanedAlterTables(sql) {
 
 	// Find all ALTER TABLE statements using regex
 	// Pattern: ALTER TABLE [IF EXISTS] [schema.]table ...;
-	const alterTablePattern = /ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?("?\w+"?(?:\."?\w+"?)?)[^;]*;/gi;
+	const alterTablePattern = /ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?("?\w+"?(?:\."?\w+"?)?)[^;]*;/gi;
 
 	let match;
 	while ((match = alterTablePattern.exec(sql)) !== null) {
