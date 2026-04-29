@@ -931,9 +931,14 @@ describe('parsePostgresSQL with contracts.sql patterns', () => {
 });
 
 describe('generateForeignKeySql', () => {
-	it('generates ALTER TABLE ADD FOREIGN KEY statement', () => {
+	it('generates a named ALTER TABLE ADD CONSTRAINT FOREIGN KEY statement', () => {
 		const sql = generateForeignKeySql('public.orders', 'user_id', 'public.users', 'id');
-		expect(sql).toBe('ALTER TABLE public.orders ADD FOREIGN KEY (user_id) REFERENCES public.users (id);');
+		expect(sql).toBe('ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id);');
+	});
+
+	it('strips quotes from identifiers when building the constraint name', () => {
+		const sql = generateForeignKeySql('"public"."orders"', '"user_id"', '"public"."users"', 'id');
+		expect(sql).toContain('CONSTRAINT orders_user_id_fkey');
 	});
 });
 
@@ -1126,7 +1131,7 @@ CREATE TABLE public.users (
 `;
 		const result = addPrimaryKeyColumn(sql, 'public.users', 'id');
 		expect(result).toHaveProperty('sql');
-		expect(result.sql).toContain('ALTER TABLE public.users ADD PRIMARY KEY (id)');
+		expect(result.sql).toContain('ALTER TABLE public.users ADD CONSTRAINT users_pkey PRIMARY KEY (id)');
 	});
 
 	it('extends existing ALTER TABLE PRIMARY KEY to compound key', () => {
@@ -1169,7 +1174,7 @@ CREATE TABLE public.users (
 `;
 		const result = addPrimaryKeyColumn(sql, 'public.users', 'tenant_id');
 		expect(result).toHaveProperty('sql');
-		expect(result.sql).toContain('PRIMARY KEY (id, tenant_id)');
+		expect(result.sql).toContain('CONSTRAINT users_pkey PRIMARY KEY (id, tenant_id)');
 		expect(result.sql).not.toContain('BIGINT PRIMARY KEY');
 	});
 });

@@ -677,6 +677,44 @@ export const CREATE_TABLE_TEMPLATE = `CREATE TABLE schema.table_name (
 );`;
 
 /**
+ * Strip surrounding double quotes from an identifier.
+ * @param {string} identifier
+ * @returns {string}
+ */
+function stripQuotes(identifier) {
+	return identifier.replace(/^"(.*)"$/, '$1');
+}
+
+/**
+ * Get the unqualified, unquoted table name from a possibly schema-qualified name.
+ * @param {string} qualifiedName - e.g. "schema.table" or just "table"
+ * @returns {string}
+ */
+function unqualifiedTableName(qualifiedName) {
+	const parts = qualifiedName.split('.');
+	return stripQuotes(parts[parts.length - 1]);
+}
+
+/**
+ * Build the conventional PostgreSQL primary key constraint name: <table>_pkey
+ * @param {string} qualifiedTable
+ * @returns {string}
+ */
+function primaryKeyConstraintName(qualifiedTable) {
+	return `${unqualifiedTableName(qualifiedTable)}_pkey`;
+}
+
+/**
+ * Build the conventional PostgreSQL foreign key constraint name: <table>_<column>_fkey
+ * @param {string} qualifiedTable
+ * @param {string} columnName
+ * @returns {string}
+ */
+function foreignKeyConstraintName(qualifiedTable, columnName) {
+	return `${unqualifiedTableName(qualifiedTable)}_${stripQuotes(columnName)}_fkey`;
+}
+
+/**
  * Generate an ALTER TABLE ADD FOREIGN KEY statement
  * @param {string} sourceTable - Fully qualified source table name
  * @param {string} sourceColumn - Column in the source table
@@ -685,7 +723,8 @@ export const CREATE_TABLE_TEMPLATE = `CREATE TABLE schema.table_name (
  * @returns {string}
  */
 export function generateForeignKeySql(sourceTable, sourceColumn, targetTable, targetColumn) {
-	return `ALTER TABLE ${sourceTable} ADD FOREIGN KEY (${sourceColumn}) REFERENCES ${targetTable} (${targetColumn});`;
+	const constraintName = foreignKeyConstraintName(sourceTable, sourceColumn);
+	return `ALTER TABLE ${sourceTable} ADD CONSTRAINT ${constraintName} FOREIGN KEY (${sourceColumn}) REFERENCES ${targetTable} (${targetColumn});`;
 }
 
 /**
@@ -864,7 +903,7 @@ export function addPrimaryKeyColumn(sqlContent, tableName, columnName) {
 				// Add table-level compound PK at the end
 				const trimmedBody = newBody.trimEnd();
 				const hasTrailingComma = trimmedBody.endsWith(',');
-				const bodyWithConstraint = trimmedBody + (hasTrailingComma ? '' : ',') + `\n  PRIMARY KEY (${existingPkColumn}, ${columnName})`;
+				const bodyWithConstraint = trimmedBody + (hasTrailingComma ? '' : ',') + `\n  CONSTRAINT ${primaryKeyConstraintName(tableName)} PRIMARY KEY (${existingPkColumn}, ${columnName})`;
 				const newSqlContent = sqlContent.slice(0, createMatch.index) + createStart + bodyWithConstraint + createEnd + sqlContent.slice(createMatch.index + createMatch[0].length);
 				return { sql: newSqlContent.trim() + '\n' };
 			}
@@ -872,7 +911,7 @@ export function addPrimaryKeyColumn(sqlContent, tableName, columnName) {
 	}
 
 	// No existing PK found - append ALTER TABLE ADD PRIMARY KEY
-	const alterStatement = `\nALTER TABLE ${tableName} ADD PRIMARY KEY (${columnName});\n`;
+	const alterStatement = `\nALTER TABLE ${tableName} ADD CONSTRAINT ${primaryKeyConstraintName(tableName)} PRIMARY KEY (${columnName});\n`;
 	return { sql: sqlContent.trim() + alterStatement };
 }
 
