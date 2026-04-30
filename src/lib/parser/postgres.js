@@ -133,11 +133,13 @@ function parseCreateTable(stream, foreignKeys, tableMap, errors) {
 
 	/** @type {Column[]} */
 	const columns = [];
+	/** @type {string[]} */
+	const tableLevelPkColumns = [];
 
 	// Parse columns
 	while (!stream.isEOF() && !stream.is('PUNCTUATION', ')')) {
 		try {
-			// Check for table-level constraint (skip it)
+			// Check for table-level constraint
 			if (
 				stream.is('KEYWORD', 'CONSTRAINT') ||
 				stream.is('KEYWORD', 'PRIMARY') ||
@@ -145,6 +147,17 @@ function parseCreateTable(stream, foreignKeys, tableMap, errors) {
 				stream.is('KEYWORD', 'UNIQUE') ||
 				stream.is('KEYWORD', 'CHECK')
 			) {
+				// Consume optional `CONSTRAINT <name>` prefix
+				if (stream.is('KEYWORD', 'CONSTRAINT')) {
+					stream.next();
+					parseIdentifier(stream);
+				}
+
+				if (stream.is('KEYWORD', 'PRIMARY')) {
+					tableLevelPkColumns.push(...parseTableLevelPrimaryKey(stream));
+				}
+
+				// Skip any remaining constraint tokens (modifiers, FK clauses, etc.)
 				skipTableConstraint(stream);
 			} else {
 				const column = parseColumn(stream, qualifiedName, foreignKeys, tableMap, errors);
@@ -174,12 +187,47 @@ function parseCreateTable(stream, foreignKeys, tableMap, errors) {
 	}
 	stream.match('PUNCTUATION', ';');
 
+	// Apply any table-level PRIMARY KEY constraints to matching columns
+	for (const pkCol of tableLevelPkColumns) {
+		const column = columns.find((c) => c.name === pkCol);
+		if (column) {
+			column.isPrimaryKey = true;
+		}
+	}
+
 	return {
 		schema,
 		name,
 		qualifiedName,
 		columns
 	};
+}
+
+/**
+ * Parse a table-level PRIMARY KEY clause, expects stream positioned at `PRIMARY` keyword.
+ * Consumes through the closing `)` of the column list.
+ * @param {TokenStream} stream
+ * @returns {string[]}
+ */
+function parseTableLevelPrimaryKey(stream) {
+	stream.next(); // consume PRIMARY
+	stream.match('KEYWORD', 'KEY');
+
+	/** @type {string[]} */
+	const pkColumns = [];
+
+	if (stream.match('PUNCTUATION', '(')) {
+		while (!stream.isEOF() && !stream.is('PUNCTUATION', ')')) {
+			const col = parseIdentifier(stream);
+			if (col) {
+				pkColumns.push(col);
+			}
+			stream.match('PUNCTUATION', ',');
+		}
+		stream.match('PUNCTUATION', ')');
+	}
+
+	return pkColumns;
 }
 
 /**

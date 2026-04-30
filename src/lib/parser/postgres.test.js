@@ -381,7 +381,7 @@ describe('parsePostgresSQL', () => {
 		expect(result.tables[0].name).toBe('users');
 	});
 
-	it('skips table-level constraints', () => {
+	it('recognizes table-level PRIMARY KEY and skips other constraints', () => {
 		const sql = `
       CREATE TABLE users (
         id integer,
@@ -395,7 +395,44 @@ describe('parsePostgresSQL', () => {
 
 		expect(result.tables[0].columns).toHaveLength(2);
 		expect(result.tables[0].columns[0].name).toBe('id');
+		expect(result.tables[0].columns[0].isPrimaryKey).toBe(true);
 		expect(result.tables[0].columns[1].name).toBe('name');
+		expect(result.tables[0].columns[1].isPrimaryKey).toBe(false);
+	});
+
+	it('recognizes named table-level CONSTRAINT ... PRIMARY KEY with quoted column', () => {
+		const sql = `
+      CREATE TABLE assertion_fact (
+        "id" integer,
+        value text,
+        CONSTRAINT assertion_fact_pkey PRIMARY KEY ("id")
+      );
+    `;
+
+		const result = parsePostgresSQL(sql);
+
+		expect(result.tables[0].columns).toHaveLength(2);
+		expect(result.tables[0].columns[0].name).toBe('id');
+		expect(result.tables[0].columns[0].isPrimaryKey).toBe(true);
+		expect(result.tables[0].columns[1].isPrimaryKey).toBe(false);
+	});
+
+	it('recognizes compound table-level PRIMARY KEY', () => {
+		const sql = `
+      CREATE TABLE membership (
+        user_id integer,
+        group_id integer,
+        joined_at timestamp,
+        CONSTRAINT membership_pkey PRIMARY KEY (user_id, group_id)
+      );
+    `;
+
+		const result = parsePostgresSQL(sql);
+
+		const cols = result.tables[0].columns;
+		expect(cols.find((c) => c.name === 'user_id')?.isPrimaryKey).toBe(true);
+		expect(cols.find((c) => c.name === 'group_id')?.isPrimaryKey).toBe(true);
+		expect(cols.find((c) => c.name === 'joined_at')?.isPrimaryKey).toBe(false);
 	});
 });
 
