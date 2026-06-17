@@ -155,9 +155,11 @@ function parseCreateTable(stream, foreignKeys, tableMap, errors) {
 
 				if (stream.is('KEYWORD', 'PRIMARY')) {
 					tableLevelPkColumns.push(...parseTableLevelPrimaryKey(stream));
+				} else if (stream.is('KEYWORD', 'FOREIGN')) {
+					parseForeignKeyConstraint(stream, qualifiedName, foreignKeys, tableMap, errors);
 				}
 
-				// Skip any remaining constraint tokens (modifiers, FK clauses, etc.)
+				// Skip any remaining constraint tokens (modifiers, ON DELETE/UPDATE clauses, etc.)
 				skipTableConstraint(stream);
 			} else {
 				const column = parseColumn(stream, qualifiedName, foreignKeys, tableMap, errors);
@@ -228,6 +230,93 @@ function parseTableLevelPrimaryKey(stream) {
 	}
 
 	return pkColumns;
+}
+
+/**
+ * Parse a FOREIGN KEY constraint clause. The stream must be positioned at the
+ * `FOREIGN` keyword. Consumes through the closing `)` of the target column list
+ * (or the target table name when no column list is present) and pushes one
+ * resolved foreign key per source column into `foreignKeys`.
+ *
+ * Shared by table-level constraints inside CREATE TABLE and ALTER TABLE ADD.
+ * @param {TokenStream} stream
+ * @param {string} sourceTable - Qualified name of the table owning the constraint
+ * @param {ForeignKey[]} foreignKeys
+ * @param {Map<string, Table>} tableMap
+ * @param {ParseError[]} errors
+ */
+function parseForeignKeyConstraint(stream, sourceTable, foreignKeys, tableMap, errors) {
+	const fkLine = stream.line();
+	stream.next(); // consume FOREIGN
+	if (!stream.match('KEYWORD', 'KEY')) {
+		return;
+	}
+
+	// Parse source column(s)
+	if (!stream.match('PUNCTUATION', '(')) {
+		return;
+	}
+	const sourceColumns = [];
+	while (!stream.isEOF() && !stream.is('PUNCTUATION', ')')) {
+		const col = parseIdentifier(stream);
+		if (col) {
+			sourceColumns.push(col);
+		}
+		stream.match('PUNCTUATION', ',');
+	}
+	stream.match('PUNCTUATION', ')');
+
+	// Expect REFERENCES
+	if (!stream.match('KEYWORD', 'REFERENCES')) {
+		return;
+	}
+
+	const { schema: targetSchema, name: targetName } = parseQualifiedName(stream);
+	const targetQualifiedName = `${targetSchema}.${targetName}`;
+
+	// Check for optional target column(s)
+	let targetColumns = [];
+	if (stream.match('PUNCTUATION', '(')) {
+		while (!stream.isEOF() && !stream.is('PUNCTUATION', ')')) {
+			const col = parseIdentifier(stream);
+			if (col) {
+				targetColumns.push(col);
+			}
+			stream.match('PUNCTUATION', ',');
+		}
+		stream.match('PUNCTUATION', ')');
+	}
+
+	// If no target columns specified, resolve to the target table's primary key.
+	// The target table may not be parsed yet (forward reference); in that case the
+	// column is resolved later in the post-process pass.
+	if (targetColumns.length === 0) {
+		const targetTable = tableMap.get(targetQualifiedName);
+		if (targetTable) {
+			const pkColumns = targetTable.columns.filter((c) => c.isPrimaryKey);
+			if (pkColumns.length > 0) {
+				targetColumns = pkColumns.map((c) => c.name);
+			} else {
+				errors.push({
+					message: `Foreign key references ${targetQualifiedName} which has no primary key`,
+					line: fkLine
+				});
+			}
+		}
+	}
+
+	// Create FK entries (one per source column if multiple)
+	for (let i = 0; i < sourceColumns.length; i++) {
+		const targetCol = targetColumns[i] || targetColumns[0] || '';
+		if (targetCol || targetColumns.length === 0) {
+			foreignKeys.push({
+				sourceTable,
+				sourceColumn: sourceColumns[i],
+				targetTable: targetQualifiedName,
+				targetColumn: targetCol
+			});
+		}
+	}
 }
 
 /**
@@ -641,72 +730,7 @@ function parseAlterTable(stream, tableMap, foreignKeys, errors) {
 					}
 				}
 			} else if (stream.is('KEYWORD', 'FOREIGN')) {
-				const fkLine = stream.line();
-				stream.next();
-				if (stream.match('KEYWORD', 'KEY')) {
-					// Parse source column(s)
-					if (stream.match('PUNCTUATION', '(')) {
-						const sourceColumns = [];
-						while (!stream.isEOF() && !stream.is('PUNCTUATION', ')')) {
-							const col = parseIdentifier(stream);
-							if (col) {
-								sourceColumns.push(col);
-							}
-							stream.match('PUNCTUATION', ',');
-						}
-						stream.match('PUNCTUATION', ')');
-
-						// Expect REFERENCES
-						if (stream.match('KEYWORD', 'REFERENCES')) {
-							const { schema: targetSchema, name: targetName } = parseQualifiedName(stream);
-							const targetQualifiedName = `${targetSchema}.${targetName}`;
-
-							// Check for optional target column(s)
-							let targetColumns = [];
-							if (stream.match('PUNCTUATION', '(')) {
-								while (!stream.isEOF() && !stream.is('PUNCTUATION', ')')) {
-									const col = parseIdentifier(stream);
-									if (col) {
-										targetColumns.push(col);
-									}
-									stream.match('PUNCTUATION', ',');
-								}
-								stream.match('PUNCTUATION', ')');
-							}
-
-							// If no target columns specified, resolve to PK
-							if (targetColumns.length === 0) {
-								const targetTable = tableMap.get(targetQualifiedName);
-								if (targetTable) {
-									const pkColumns = targetTable.columns.filter((c) => c.isPrimaryKey);
-									if (pkColumns.length > 0) {
-										targetColumns = pkColumns.map((c) => c.name);
-									} else {
-										errors.push({
-											message: `Foreign key references ${targetQualifiedName} which has no primary key`,
-											line: fkLine
-										});
-									}
-								}
-								// If target table not found, we still create the FK (table might be defined later or external)
-								// but we can't resolve the column
-							}
-
-							// Create FK entries (one per source column if multiple)
-							for (let i = 0; i < sourceColumns.length; i++) {
-								const targetCol = targetColumns[i] || targetColumns[0] || '';
-								if (targetCol || targetColumns.length === 0) {
-									foreignKeys.push({
-										sourceTable: qualifiedName,
-										sourceColumn: sourceColumns[i],
-										targetTable: targetQualifiedName,
-										targetColumn: targetCol
-									});
-								}
-							}
-						}
-					}
-				}
+				parseForeignKeyConstraint(stream, qualifiedName, foreignKeys, tableMap, errors);
 			}
 		} else {
 			stream.next();
@@ -1122,8 +1146,13 @@ export function findOrphanedAlterTables(sql) {
 	const flaggedPositions = new Set();
 
 	// Find all ALTER TABLE statements using regex
-	// Pattern: ALTER TABLE [IF EXISTS] [schema.]table ...;
-	const alterTablePattern = /ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?("?\w+"?(?:\."?\w+"?)?)[^;]*;/gi;
+	// Pattern: ALTER TABLE [IF EXISTS] [ONLY] [schema.]table ...;
+	// A table reference is one or two name parts; each part is either a quoted
+	// identifier (which may itself contain dots, e.g. "Schema.Table") or a bare word.
+	const alterTablePattern = new RegExp(
+		`ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:ONLY\\s+)?(${TABLE_REF_PATTERN})[^;]*;`,
+		'gi'
+	);
 
 	let match;
 	while ((match = alterTablePattern.exec(sql)) !== null) {
@@ -1144,7 +1173,7 @@ export function findOrphanedAlterTables(sql) {
 		}
 
 		// Check if any REFERENCES clause points to a non-existent table
-		const referencesPattern = /REFERENCES\s+("?\w+"?(?:\."?\w+"?)?)/gi;
+		const referencesPattern = new RegExp(`REFERENCES\\s+(${TABLE_REF_PATTERN})`, 'gi');
 		let refMatch;
 		while ((refMatch = referencesPattern.exec(statement)) !== null) {
 			const refTableName = normalizeTableName(refMatch[1]);
@@ -1165,17 +1194,79 @@ export function findOrphanedAlterTables(sql) {
 }
 
 /**
- * Normalize a table name reference to qualified form (schema.table).
- * @param {string} tableRef - Table reference like "schema.table", schema.table, or just table
+ * Regex fragment matching a (possibly schema-qualified) table reference.
+ * Each name part is either a double-quoted identifier (which may contain dots,
+ * e.g. "Schema.Table", or escaped quotes "") or a bare word. Only a dot that
+ * sits between two parts acts as a schema separator.
+ */
+const TABLE_REF_PATTERN = `(?:"(?:[^"]|"")*"|\\w+)(?:\\s*\\.\\s*(?:"(?:[^"]|"")*"|\\w+))?`;
+
+/**
+ * Split a table reference into its name parts, respecting double-quoting so a dot
+ * inside a quoted identifier is not treated as a schema separator.
+ * @param {string} tableRef
+ * @returns {{ value: string, quoted: boolean }[]}
+ */
+function splitQualifiedRef(tableRef) {
+	/** @type {{ value: string, quoted: boolean }[]} */
+	const parts = [];
+	let i = 0;
+	while (i < tableRef.length) {
+		// Skip whitespace and part separators
+		while (i < tableRef.length && (/\s/.test(tableRef[i]) || tableRef[i] === '.')) {
+			i++;
+		}
+		if (i >= tableRef.length) {
+			break;
+		}
+		if (tableRef[i] === '"') {
+			i++; // opening quote
+			let value = '';
+			while (i < tableRef.length) {
+				if (tableRef[i] === '"') {
+					if (tableRef[i + 1] === '"') {
+						value += '"';
+						i += 2;
+					} else {
+						i++; // closing quote
+						break;
+					}
+				} else {
+					value += tableRef[i];
+					i++;
+				}
+			}
+			parts.push({ value, quoted: true });
+		} else {
+			let value = '';
+			while (i < tableRef.length && !/[\s.]/.test(tableRef[i])) {
+				value += tableRef[i];
+				i++;
+			}
+			parts.push({ value, quoted: false });
+		}
+	}
+	return parts;
+}
+
+/**
+ * Normalize a table name reference to qualified form (schema.table), matching the
+ * semantics of {@link parseQualifiedName}: unquoted identifiers fold to lowercase,
+ * quoted identifiers keep their case (and any internal dots), and an unqualified
+ * name defaults to the `public` schema.
+ * @param {string} tableRef - Table reference like "schema.table", schema.table, "Schema.Table", or just table
  * @returns {string}
  */
 function normalizeTableName(tableRef) {
-	// Remove quotes and normalize
-	const cleaned = tableRef.replace(/"/g, '');
-	if (cleaned.includes('.')) {
-		return cleaned.toLowerCase();
+	const parts = splitQualifiedRef(tableRef).map((p) => (p.quoted ? p.value : p.value.toLowerCase()));
+	if (parts.length === 0) {
+		return '';
 	}
-	return `public.${cleaned.toLowerCase()}`;
+	if (parts.length === 1) {
+		return `public.${parts[0]}`;
+	}
+	// schema.name (parser only recognises two parts)
+	return `${parts[0]}.${parts[1]}`;
 }
 
 /**

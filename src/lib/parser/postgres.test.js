@@ -652,6 +652,83 @@ describe('parsePostgresSQL foreign keys', () => {
 		});
 		expect(result.errors).toHaveLength(0);
 	});
+
+	it('parses table-level FOREIGN KEY constraints inside CREATE TABLE', () => {
+		const sql = `
+      CREATE TABLE users (id integer PRIMARY KEY);
+      CREATE TABLE posts (
+        id integer PRIMARY KEY,
+        user_id integer NOT NULL,
+        CONSTRAINT fk_posts_user FOREIGN KEY (user_id) REFERENCES users (id)
+      );
+    `;
+
+		const result = parsePostgresSQL(sql);
+
+		expect(result.errors).toEqual([]);
+		expect(result.foreignKeys).toHaveLength(1);
+		expect(result.foreignKeys[0]).toEqual({
+			sourceTable: 'public.posts',
+			sourceColumn: 'user_id',
+			targetTable: 'public.users',
+			targetColumn: 'id'
+		});
+	});
+
+	it('parses table-level FOREIGN KEY whose target column resolves to the PK', () => {
+		const sql = `
+      CREATE TABLE users (id integer, CONSTRAINT pk_users PRIMARY KEY (id));
+      CREATE TABLE posts (
+        id integer PRIMARY KEY,
+        user_id integer NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users
+      );
+    `;
+
+		const result = parsePostgresSQL(sql);
+
+		expect(result.errors).toEqual([]);
+		expect(result.foreignKeys).toHaveLength(1);
+		expect(result.foreignKeys[0]).toEqual({
+			sourceTable: 'public.posts',
+			sourceColumn: 'user_id',
+			targetTable: 'public.users',
+			targetColumn: 'id'
+		});
+	});
+
+	it('parses multiple table-level FOREIGN KEY constraints with ON DELETE clauses', () => {
+		const sql = `
+      CREATE TABLE "App.Period" ("PeriodID" integer PRIMARY KEY);
+      CREATE TABLE "App.Company" ("CompanyID" integer PRIMARY KEY);
+      CREATE TABLE "App.Data" (
+        "ISPID" bigint PRIMARY KEY,
+        "PeriodID" integer NOT NULL,
+        "CompanyID" integer NOT NULL,
+        CONSTRAINT "FK_App.Data.PeriodID"
+          FOREIGN KEY ("PeriodID") REFERENCES "App.Period" ("PeriodID") ON DELETE SET NULL,
+        CONSTRAINT "FK_App.Data.CompanyID"
+          FOREIGN KEY ("CompanyID") REFERENCES "App.Company" ("CompanyID")
+      );
+    `;
+
+		const result = parsePostgresSQL(sql);
+
+		expect(result.errors).toEqual([]);
+		expect(result.foreignKeys).toHaveLength(2);
+		expect(result.foreignKeys[0]).toEqual({
+			sourceTable: 'public.App.Data',
+			sourceColumn: 'PeriodID',
+			targetTable: 'public.App.Period',
+			targetColumn: 'PeriodID'
+		});
+		expect(result.foreignKeys[1]).toEqual({
+			sourceTable: 'public.App.Data',
+			sourceColumn: 'CompanyID',
+			targetTable: 'public.App.Company',
+			targetColumn: 'CompanyID'
+		});
+	});
 });
 
 describe('parsePostgresSQL inline REFERENCES', () => {
@@ -1397,6 +1474,29 @@ ALTER TABLE public.users ADD FOREIGN KEY (org_id) REFERENCES public.orgs;
 		const tableNames = orphaned.map((o) => o.tableName);
 		expect(tableNames).toContain('public.posts');
 		expect(tableNames).toContain('public.orgs');
+	});
+
+	it('does not flag ALTER TABLE on a quoted identifier that contains a dot', () => {
+		// "Schema.Table" is a single quoted identifier in the public schema, not schema.table.
+		const sql = `
+CREATE TABLE "IntercompanyISP.BranchCompany" ("CompanyID" integer PRIMARY KEY, "ContactUserID" integer);
+CREATE TABLE system.auth_user (id integer PRIMARY KEY);
+ALTER TABLE "IntercompanyISP.BranchCompany"
+    ADD CONSTRAINT "FK_IntercompanyISP.BranchCompany.ContactUserID"
+        FOREIGN KEY ("ContactUserID") REFERENCES system.auth_user (id) ON DELETE SET NULL;
+`;
+		const orphaned = findOrphanedAlterTables(sql);
+		expect(orphaned).toHaveLength(0);
+	});
+
+	it('flags a quoted-with-dot table only when it is genuinely undefined', () => {
+		const sql = `
+CREATE TABLE "App.Real" (id integer PRIMARY KEY);
+ALTER TABLE "App.Missing" ADD PRIMARY KEY (id);
+`;
+		const orphaned = findOrphanedAlterTables(sql);
+		expect(orphaned).toHaveLength(1);
+		expect(orphaned[0].tableName).toBe('public.App.Missing');
 	});
 });
 
