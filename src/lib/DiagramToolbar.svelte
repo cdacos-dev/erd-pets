@@ -7,12 +7,14 @@
    * @typedef {'rounded' | 'bezier'} EdgeStyle
    */
 
-  /** @type {{ onNew: () => void, onLoad: () => void, onRefresh: () => void, onSave: () => void, onDiagramChange: (id: string) => void, onLayout: (type: LayoutType) => void, onEdgeStyleChange: (style: EdgeStyle) => void, onExport: (pixelRatio: number | 'max') => void, onAddDiagram: () => void, onDiagramSettings: () => void, diagrams: DiagramDefinition[], selectedDiagramId: string, fileLoaded: boolean, diagramFileName: string, sqlFileName: string, dbType: string, edgeStyle: EdgeStyle, showSidebar: boolean, onToggleSidebar: () => void }} */
+  /** @type {{ onNew: () => void, onLoad: () => void, onRefresh: () => void, onSave: () => void, onShare: () => void, onSaveAsFiles: () => void, onDiagramChange: (id: string) => void, onLayout: (type: LayoutType) => void, onEdgeStyleChange: (style: EdgeStyle) => void, onExport: (pixelRatio: number | 'max') => void, onAddDiagram: () => void, onDiagramSettings: () => void, diagrams: DiagramDefinition[], selectedDiagramId: string, hasDiagram: boolean, hasHandle: boolean, shareSupported: boolean, isSharedSession: boolean, diagramFileName: string, sqlFileName: string, dbType: string, edgeStyle: EdgeStyle, showSidebar: boolean, onToggleSidebar: () => void }} */
   let {
     onNew,
     onLoad,
     onRefresh,
     onSave,
+    onShare,
+    onSaveAsFiles,
     onDiagramChange,
     onLayout,
     onEdgeStyleChange,
@@ -21,7 +23,10 @@
     onDiagramSettings,
     diagrams,
     selectedDiagramId,
-    fileLoaded,
+    hasDiagram,
+    hasHandle,
+    shareSupported = false,
+    isSharedSession = false,
     diagramFileName = '',
     sqlFileName = '',
     dbType = 'PostgreSQL',
@@ -73,7 +78,7 @@
     class:active={showSidebar}
     onclick={onToggleSidebar}
     title="Toggle sidebar (Cmd+B)"
-    disabled={!fileLoaded}
+    disabled={!hasDiagram}
   >
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
       <path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
@@ -81,9 +86,17 @@
   </button>
   <button onclick={onNew}>New</button>
   <button onclick={onLoad}>Open</button>
-  {#if fileLoaded}
+  {#if hasHandle}
     <button onclick={onRefresh}>Refresh</button>
     <button onclick={onSave}>Save</button>
+  {/if}
+  {#if isSharedSession}
+    <button onclick={onSaveAsFiles} title="Save this shared diagram as local files to edit it">Save as files…</button>
+  {/if}
+  {#if hasDiagram}
+    {#if shareSupported}
+      <button onclick={onShare} title="Copy a self-contained share link to the clipboard">Share</button>
+    {/if}
     <select
       class="export-select"
       onchange={handleExportChange}
@@ -110,7 +123,7 @@
     </select>
   {/if}
   <ThemeSelector />
-  {#if fileLoaded}
+  {#if hasDiagram}
     <button
       class="settings-btn"
       onclick={onDiagramSettings}

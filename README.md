@@ -29,6 +29,23 @@ npm run dev
 4. Click **Save** (or `Cmd+S`) to persist positions
 5. Click **Refresh** (or `Cmd+R`) to reload the SQL file after schema changes
 
+## Share links
+
+Click **Share** to copy a self-contained link to the clipboard. The entire
+project — the SQL schema **and** the diagram layout (positions, colors, notes,
+arrows, and every diagram tab) — is compressed into the URL fragment, so the
+recipient can open the link and see the diagram with **no files required** on
+their machine.
+
+A few things to keep in mind:
+
+* The link is a **snapshot**. Later edits aren't reflected until you send a new link.
+* The blob is plaintext to anyone with the link — don't share schemas you want kept private.
+* Very large schemas make very long links. The browser handles them fine, but some
+  chat apps and link unfurlers may truncate them; you'll get a warning past ~8,000 characters.
+* Opening a shared link starts a read-only session (there are no files to write to).
+  Click **Save as files…** to write the SQL and diagram to local files and start editing.
+
 ## File Format
 
 Diagrams are stored in `.erd-pets.json` files (JSONC with comments allowed):
