@@ -1,5 +1,5 @@
 <script>
-  import { untrack } from 'svelte';
+  import { untrack, onMount } from 'svelte';
   import {
     SvelteFlow,
     Controls,
@@ -25,6 +25,18 @@
   import EdgeContextMenu from './lib/EdgeContextMenu.svelte';
   import NoteContextMenu from './lib/components/NoteContextMenu.svelte';
   import FlowInstanceCapture from './lib/FlowInstanceCapture.svelte';
+  import RecentProjects from './lib/RecentProjects.svelte';
+  import {
+    isRecentSupported,
+    listRecentProjects,
+    saveRecentProject,
+    removeRecentProject,
+    hasReadPermission,
+    ensureReadPermission,
+    projectKey,
+    getUrlProjectKey,
+    setUrlProjectKey,
+  } from './lib/recentProjects.js';
   import { circularLayout } from './lib/layouts/circular.js';
   import { hierarchicalLayout } from './lib/layouts/hierarchical.js';
   import {
@@ -63,6 +75,12 @@
 
   /** @type {FileSystemFileHandle | null} */
   let sqlHandle = $state(null);
+
+  /** @type {import('./lib/recentProjects.js').RecentProject[]} */
+  let recentProjects = $state([]);
+
+  /** Project key from the URL hash to highlight/auto-open on the welcome screen. */
+  let pendingAutoOpenKey = $state(null);
 
   /** @type {string} */
   let diagramFileName = $state('');
@@ -146,6 +164,39 @@
 
   /** @type {boolean} */
   let isDarkMode = $state(false);
+
+  // Load recent projects and, if the URL carries a project key, auto-open it when
+  // file permission is still granted (otherwise highlight it for a one-click open).
+  onMount(async () => {
+    if (isRecentSupported()) {
+      try {
+        recentProjects = await listRecentProjects();
+      } catch (err) {
+        console.warn('Failed to load recent projects', err);
+      }
+    }
+
+    const key = getUrlProjectKey();
+    if (!key) return;
+
+    const project = recentProjects.find((p) => p.key === key);
+    if (!project) return;
+
+    const granted =
+      (await hasReadPermission(project.diagramHandle)) &&
+      (await hasReadPermission(project.sqlHandle));
+
+    if (granted) {
+      try {
+        await loadProject(project.diagramHandle, project.sqlHandle, { silent: true });
+      } catch {
+        pendingAutoOpenKey = key;
+      }
+    } else {
+      // Permission needs a user gesture; surface the project for a single click.
+      pendingAutoOpenKey = key;
+    }
+  });
 
   // Track dark mode changes
   $effect(() => {
@@ -1107,6 +1158,133 @@
   }
 
   /**
+   * Read a diagram + SQL handle pair, parse, render, and record as a recent project.
+   * @param {FileSystemFileHandle} dHandle - Diagram (.erd-pets.json) handle
+   * @param {FileSystemFileHandle} sHandle - SQL file handle
+   * @param {{ silent?: boolean }} [options]
+   * @returns {Promise<boolean>} Whether the project loaded successfully
+   */
+  async function loadProject(dHandle, sHandle, options = {}) {
+    const dFile = await dHandle.getFile();
+    const dContent = await dFile.text();
+
+    const { data: parsedDiagram, errors: diagramErrors } = parseDiagramFile(dContent);
+    if (diagramErrors.length > 0) {
+      for (const error of diagramErrors) {
+        showToast(error.message, 'error');
+      }
+    }
+    if (!parsedDiagram) {
+      showToast('Failed to parse diagram file.', 'error');
+      return false;
+    }
+
+    const sFile = await sHandle.getFile();
+    const sContent = await sFile.text();
+    const newParseResult = parsePostgresSQL(sContent);
+    if (newParseResult.errors.length > 0) {
+      for (const error of newParseResult.errors) {
+        showToast(error.message || String(error), 'error');
+      }
+    }
+
+    diagramHandle = dHandle;
+    sqlHandle = sHandle;
+    diagramFileName = dFile.name;
+    sqlFileName = sFile.name;
+    diagramContent = dContent;
+    sqlContent = sContent;
+    diagramFile = parsedDiagram;
+    parseResult = newParseResult;
+
+    selectedDiagramId = parsedDiagram.diagrams[0]?.id ?? '';
+    if (selectedDiagramId) {
+      const diagram = parsedDiagram.diagrams.find((d) => d.id === selectedDiagramId);
+      if (diagram) {
+        convertToFlowWithDiagram(diagram, newParseResult.tables, newParseResult.foreignKeys);
+      }
+    } else {
+      convertToFlow(newParseResult.tables, newParseResult.foreignKeys);
+    }
+
+    await rememberProject(dHandle, sHandle, dFile.name, sFile.name);
+
+    if (newParseResult.tables.length === 0) {
+      showToast('No tables found in the SQL file.', 'info');
+    } else if (!options.silent) {
+      showToast(`Loaded ${newParseResult.tables.length} tables.`, 'success');
+    }
+    return true;
+  }
+
+  /**
+   * Record a loaded project in recents and update the bookmarkable URL hash.
+   * @param {FileSystemFileHandle} dHandle
+   * @param {FileSystemFileHandle} sHandle
+   * @param {string} dName - Diagram file name
+   * @param {string} sName - SQL file name
+   */
+  async function rememberProject(dHandle, sHandle, dName, sName) {
+    const key = projectKey(dName);
+    setUrlProjectKey(key);
+    pendingAutoOpenKey = null;
+    if (!isRecentSupported()) return;
+    try {
+      await saveRecentProject({
+        key,
+        name: dName.replace(/\.erd-pets\.json$/i, '').replace(/\.json$/i, ''),
+        diagramFileName: dName,
+        sqlFileName: sName,
+        diagramHandle: dHandle,
+        sqlHandle: sHandle,
+      });
+      recentProjects = await listRecentProjects();
+    } catch (err) {
+      // Persisting recents is best-effort; never block the load on it.
+      console.warn('Failed to save recent project', err);
+    }
+  }
+
+  /**
+   * Open a project from the recents list, re-requesting file permission as needed.
+   * @param {import('./lib/recentProjects.js').RecentProject} project
+   */
+  async function openRecent(project) {
+    try {
+      const grantedDiagram = await ensureReadPermission(project.diagramHandle);
+      const grantedSql = await ensureReadPermission(project.sqlHandle);
+      if (!grantedDiagram || !grantedSql) {
+        showToast('Permission to read the project files was not granted.', 'error');
+        return;
+      }
+      await loadProject(project.diagramHandle, project.sqlHandle);
+    } catch (err) {
+      if (err.name === 'NotFoundError') {
+        showToast(`"${project.name}" could not be found — it may have been moved or deleted.`, 'error');
+        await removeRecent(project);
+        return;
+      }
+      showToast(err.message || 'Failed to open recent project.', 'error');
+    }
+  }
+
+  /**
+   * Remove a project from the recents list.
+   * @param {import('./lib/recentProjects.js').RecentProject} project
+   */
+  async function removeRecent(project) {
+    try {
+      await removeRecentProject(project.key);
+      recentProjects = await listRecentProjects();
+      if (pendingAutoOpenKey === project.key) {
+        pendingAutoOpenKey = null;
+      }
+    } catch (err) {
+      showToast(err.message || 'Failed to remove recent project.', 'error');
+    }
+  }
+
+  /**
    * Handle New Diagram button click.
    */
   async function handleNew() {
@@ -1160,6 +1338,9 @@
       const diagram = diagramFile.diagrams[0];
       convertToFlowWithDiagram(diagram, parseResult.tables, parseResult.foreignKeys);
 
+      // Step 7: Record as a recent project and update the bookmarkable URL
+      await rememberProject(newDiagramHandle, newSqlHandle, newDiagramHandle.name, sqlFile.name);
+
       showToast(`Created new diagram with ${parseResult.tables.length} tables.`, 'success');
     } catch (err) {
       // User cancelled the picker - not an error
@@ -1185,61 +1366,18 @@
     try {
       // Step 1: Open diagram file
       const diagramResult = await openDiagramFile();
-      diagramHandle = diagramResult.handle;
-      diagramFileName = diagramResult.handle.name;
-      diagramContent = diagramResult.content;
 
-      // Step 2: Parse diagram file
-      const { data: parsedDiagram, errors: diagramErrors } = parseDiagramFile(diagramContent);
-
-      if (diagramErrors.length > 0) {
-        for (const error of diagramErrors) {
-          showToast(error.message, 'error');
-        }
+      // Step 2: Peek at the diagram so we can tell the user which SQL file to pick
+      const { data: parsedDiagram } = parseDiagramFile(diagramResult.content);
+      if (parsedDiagram?.sql) {
+        showToast(`Please select: ${parsedDiagram.sql}`, 'info');
       }
 
-      if (!parsedDiagram) {
-        showToast('Failed to parse diagram file.', 'error');
-        return;
-      }
+      // Step 3: Open the SQL file (picker starts in same directory as diagram)
+      const sqlResult = await openSqlFile(diagramResult.handle);
 
-      diagramFile = parsedDiagram;
-
-      // Step 3: Prompt user to open SQL file (picker starts in same directory as diagram)
-      showToast(`Please select: ${parsedDiagram.sql}`, 'info');
-
-      const sqlResult = await openSqlFile(diagramHandle);
-      sqlHandle = sqlResult.handle;
-      sqlFileName = sqlResult.handle.name;
-      sqlContent = sqlResult.content;
-
-      // Step 4: Parse SQL
-      parseResult = parsePostgresSQL(sqlContent);
-
-      if (parseResult.errors.length > 0) {
-        for (const error of parseResult.errors) {
-          showToast(error.message || String(error), 'error');
-        }
-      }
-
-      // Step 5: Select first diagram and render
-      selectedDiagramId = diagramFile.diagrams[0]?.id ?? '';
-
-      if (selectedDiagramId) {
-        const diagram = diagramFile.diagrams.find((d) => d.id === selectedDiagramId);
-        if (diagram) {
-          convertToFlowWithDiagram(diagram, parseResult.tables, parseResult.foreignKeys);
-        }
-      } else {
-        // No diagrams, show all tables
-        convertToFlow(parseResult.tables, parseResult.foreignKeys);
-      }
-
-      if (parseResult.tables.length === 0) {
-        showToast('No tables found in the SQL file.', 'info');
-      } else {
-        showToast(`Loaded ${parseResult.tables.length} tables.`, 'success');
-      }
+      // Step 4: Parse, render, and record (shared with recents/auto-open)
+      await loadProject(diagramResult.handle, sqlResult.handle);
     } catch (err) {
       // User cancelled the picker - not an error
       if (err.name === 'AbortError') {
@@ -2537,6 +2675,17 @@
         <MiniMap />
         <FlowInstanceCapture onCapture={(instance) => flowInstance = instance} />
       </SvelteFlow>
+      {#if !diagramHandle}
+        <RecentProjects
+          projects={recentProjects}
+          highlightKey={pendingAutoOpenKey}
+          supported={isRecentSupported()}
+          onOpen={openRecent}
+          onRemove={removeRecent}
+          onNew={handleNew}
+          onLoad={handleLoad}
+        />
+      {/if}
     </main>
   </div>
 </div>
