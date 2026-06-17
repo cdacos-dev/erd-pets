@@ -37,6 +37,14 @@
     getUrlProjectKey,
     setUrlProjectKey,
   } from './lib/recentProjects.js';
+  import {
+    isShareSupported,
+    encodeShareLink,
+    decodeShareLink,
+    getUrlShareBlob,
+    buildShareUrl,
+    SHARE_SIZE_WARN,
+  } from './lib/shareLink.js';
   import { circularLayout } from './lib/layouts/circular.js';
   import { hierarchicalLayout } from './lib/layouts/hierarchical.js';
   import {
@@ -111,6 +119,19 @@
   /** @type {import('./lib/parser/types.js').ParseResult | null} */
   let parseResult = $state(null);
 
+  /**
+   * True when the current project was opened from a share link (`#d=`) and has
+   * no file handles — a loaded, in-memory-only, read-only session.
+   */
+  let isSharedSession = $state(false);
+
+  /**
+   * Whether something is on screen (a diagram is loaded), regardless of whether
+   * writable file handles exist. Distinct from `diagramHandle`/`sqlHandle`,
+   * which gate disk writes (Save/Refresh/SQL edits).
+   */
+  let hasDiagram = $derived(!!diagramFile && !!parseResult);
+
   let diagrams = $derived(diagramFile?.diagrams ?? []);
 
   let dbType = $derived(diagramFile?.dbType ?? 'PostgreSQL');
@@ -174,6 +195,14 @@
       } catch (err) {
         console.warn('Failed to load recent projects', err);
       }
+    }
+
+    // A share link (`#d=`) is an explicit, self-contained project; it wins over
+    // the `#p=` recents key.
+    const shareBlob = getUrlShareBlob();
+    if (shareBlob) {
+      await loadSharedProject(shareBlob);
+      return;
     }
 
     const key = getUrlProjectKey();
@@ -353,6 +382,21 @@
    */
   function dismissToast(id) {
     toasts = toasts.filter((t) => t.id !== id);
+  }
+
+  /**
+   * Guard for SQL-mutating actions: returns true when the SQL file is writable.
+   * Otherwise toasts a context-appropriate message and returns false.
+   * @returns {boolean}
+   */
+  function requireSqlHandle() {
+    if (sqlHandle) return true;
+    if (isSharedSession) {
+      showToast('This is a shared diagram. Use "Save as files…" to edit it.', 'error');
+    } else {
+      showToast('No SQL file loaded. Open a diagram first.', 'error');
+    }
+    return false;
   }
 
   /**
@@ -1196,6 +1240,7 @@
     sqlContent = sContent;
     diagramFile = parsedDiagram;
     parseResult = newParseResult;
+    isSharedSession = false;
 
     selectedDiagramId = parsedDiagram.diagrams[0]?.id ?? '';
     if (selectedDiagramId) {
@@ -1242,6 +1287,201 @@
     } catch (err) {
       // Persisting recents is best-effort; never block the load on it.
       console.warn('Failed to save recent project', err);
+    }
+  }
+
+  /**
+   * Load a project from a self-contained share link blob (`#d=`).
+   * There are no file handles — the session is read-only until the recipient
+   * uses "Save as files…".
+   * @param {string} blob
+   */
+  async function loadSharedProject(blob) {
+    let sql, diagram;
+    try {
+      ({ sql, diagram } = await decodeShareLink(blob));
+    } catch (err) {
+      showToast('This share link is invalid or corrupted.', 'error');
+      return;
+    }
+
+    const { data: parsedDiagram, errors: diagramErrors } = parseDiagramFile(diagram);
+    if (diagramErrors.length > 0) {
+      for (const error of diagramErrors) {
+        showToast(error.message, 'error');
+      }
+    }
+    if (!parsedDiagram) {
+      showToast('This share link is invalid or corrupted.', 'error');
+      return;
+    }
+
+    const newParseResult = parsePostgresSQL(sql);
+    if (newParseResult.errors.length > 0) {
+      for (const error of newParseResult.errors) {
+        showToast(error.message || String(error), 'error');
+      }
+    }
+
+    // No files: leave handles null and flag the read-only shared session.
+    diagramHandle = null;
+    sqlHandle = null;
+    diagramFileName = parsedDiagram.sql || 'shared-diagram';
+    sqlFileName = parsedDiagram.sql || '';
+    diagramContent = diagram;
+    sqlContent = sql;
+    diagramFile = parsedDiagram;
+    parseResult = newParseResult;
+    isSharedSession = true;
+
+    selectedDiagramId = parsedDiagram.diagrams[0]?.id ?? '';
+    if (selectedDiagramId) {
+      const d = parsedDiagram.diagrams.find((x) => x.id === selectedDiagramId);
+      if (d) {
+        convertToFlowWithDiagram(d, newParseResult.tables, newParseResult.foreignKeys);
+      }
+    } else {
+      convertToFlow(newParseResult.tables, newParseResult.foreignKeys);
+    }
+
+    if (newParseResult.tables.length === 0) {
+      showToast('No tables found in the shared diagram.', 'info');
+    } else {
+      showToast(`Opened shared diagram (${newParseResult.tables.length} tables).`, 'success');
+    }
+  }
+
+  /**
+   * Build a serialized diagram string capturing the current on-screen layout
+   * (table positions + note positions), matching what a save would persist.
+   * @returns {string}
+   */
+  function serializeCurrentLayout() {
+    const nodePositions = getNodePositions();
+    const notePositions = getNotePositions();
+    let fileToSerialize = diagramFile;
+
+    const diagramIndex = fileToSerialize.diagrams.findIndex((d) => d.id === selectedDiagramId);
+    if (diagramIndex !== -1) {
+      const diagram = fileToSerialize.diagrams[diagramIndex];
+      if (diagram.notes && diagram.notes.length > 0) {
+        const updatedNotes = updateNotePositions(diagram.notes, notePositions);
+        const updatedDiagrams = [...fileToSerialize.diagrams];
+        updatedDiagrams[diagramIndex] = { ...diagram, notes: updatedNotes };
+        fileToSerialize = { ...fileToSerialize, diagrams: updatedDiagrams };
+      }
+    }
+
+    return serializeDiagramFile(
+      fileToSerialize,
+      selectedDiagramId,
+      nodePositions,
+      parseResult?.tables ?? []
+    );
+  }
+
+  /**
+   * Generate a self-contained share link for the current project and copy it to
+   * the clipboard. Everything (SQL + layout) is encoded into the URL fragment.
+   */
+  async function handleShare() {
+    if (!hasDiagram) {
+      showToast('Open a diagram first.', 'error');
+      return;
+    }
+    if (!isShareSupported()) {
+      showToast('Share links are not supported in this browser.', 'error');
+      return;
+    }
+
+    try {
+      const diagramString = serializeCurrentLayout();
+      const blob = await encodeShareLink({ sql: sqlContent, diagram: diagramString });
+      const url = buildShareUrl(blob);
+
+      try {
+        await navigator.clipboard.writeText(url);
+        showToast(`Share link copied (${url.length} chars).`, 'success');
+      } catch {
+        // Clipboard can be blocked (permissions / no user activation): surface
+        // the URL so the user can copy it manually.
+        showToast(`Copy this share link manually:\n${url}`, 'info');
+      }
+
+      if (url.length > SHARE_SIZE_WARN) {
+        showToast(
+          `This link is large (${url.length} chars); some chat apps may truncate it.`,
+          'error'
+        );
+      }
+    } catch (err) {
+      showToast(err.message || 'Failed to create share link.', 'error');
+    }
+  }
+
+  /**
+   * Convert a read-only shared session into a real local project by writing the
+   * SQL and diagram to files the user picks. After this, Save/Refresh/edit work.
+   */
+  async function handleSaveAsFiles() {
+    if (!isFileSystemAccessSupported()) {
+      showToast(
+        'File System Access API not supported. Please use Chrome, Edge, or another Chromium-based browser.',
+        'error'
+      );
+      return;
+    }
+    if (!diagramFile || !parseResult) {
+      showToast('No diagram to save.', 'error');
+      return;
+    }
+
+    try {
+      // Step 1: Save the SQL to a file chosen by the user.
+      const suggestedSqlName = sqlFileName || diagramFile.sql || 'schema.sql';
+      const newSqlHandle = await window.showSaveFilePicker({
+        suggestedName: suggestedSqlName,
+        types: [{ description: 'SQL Files', accept: { 'text/plain': ['.sql'] } }],
+      });
+      const sqlWritable = await newSqlHandle.createWritable();
+      try {
+        await sqlWritable.write(sqlContent);
+      } finally {
+        await sqlWritable.close();
+      }
+      const savedSqlFile = await newSqlHandle.getFile();
+
+      // Step 2: Point the diagram's `sql` reference at the chosen SQL file and
+      // serialize the current layout, then save the diagram file.
+      const diagramToSave = { ...diagramFile, sql: savedSqlFile.name };
+      const nodePositions = getNodePositions();
+      const serialized = serializeDiagramFile(
+        diagramToSave,
+        selectedDiagramId,
+        nodePositions,
+        parseResult.tables
+      );
+      const newDiagramHandle = await saveNewDiagramFile(serialized, newSqlHandle);
+      const savedDiagramFile = await newDiagramHandle.getFile();
+
+      // Step 3: Promote to a real, writable local project.
+      diagramHandle = newDiagramHandle;
+      sqlHandle = newSqlHandle;
+      diagramFileName = savedDiagramFile.name;
+      sqlFileName = savedSqlFile.name;
+      diagramContent = serialized;
+      diagramFile = diagramToSave;
+      isSharedSession = false;
+
+      // Step 4: Record as a recent project + bookmarkable URL (replaces `#d=`).
+      await rememberProject(newDiagramHandle, newSqlHandle, savedDiagramFile.name, savedSqlFile.name);
+
+      showToast('Saved as local files. You can now edit and save changes.', 'success');
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return;
+      }
+      showToast(err.message || 'Failed to save as files.', 'error');
     }
   }
 
@@ -1332,6 +1572,7 @@
       sqlContent = newSqlContent;
       parseResult = newParseResult;
       diagramFile = defaultDiagram;
+      isSharedSession = false;
       selectedDiagramId = 'main';
 
       // Step 6: Render diagram
@@ -1576,10 +1817,7 @@
    * Open the create table dialog (for new table).
    */
   function handleCreateTable() {
-    if (!sqlHandle) {
-      showToast('No SQL file loaded. Open a diagram first.', 'error');
-      return;
-    }
+    if (!requireSqlHandle()) return;
     editingTableName = '';
     editingTableSql = '';
     showCreateTableDialog = true;
@@ -1593,10 +1831,7 @@
   async function handleCreateTableSubmit(newTableSql) {
     showCreateTableDialog = false;
 
-    if (!sqlHandle) {
-      showToast('No SQL file loaded.', 'error');
-      return;
-    }
+    if (!requireSqlHandle()) return;
 
     const isEditing = !!editingTableName;
 
@@ -1697,10 +1932,7 @@
    * Open the create relationship dialog.
    */
   function handleCreateRelationship() {
-    if (!sqlHandle) {
-      showToast('No SQL file loaded. Open a diagram first.', 'error');
-      return;
-    }
+    if (!requireSqlHandle()) return;
     if (!parseResult || parseResult.tables.length === 0) {
       showToast('No tables found. Create tables first.', 'error');
       return;
@@ -1722,10 +1954,7 @@
     prefilledTargetTable = '';
     prefilledTargetColumn = '';
 
-    if (!sqlHandle) {
-      showToast('No SQL file loaded.', 'error');
-      return;
-    }
+    if (!requireSqlHandle()) return;
 
     try {
       const fkSql = generateForeignKeySql(sourceTable, sourceColumn, targetTable, targetColumn);
@@ -1761,10 +1990,7 @@
    * @param {import('./lib/parser/types.js').ForeignKey} fk
    */
   async function handleDeleteRelationship(fk) {
-    if (!sqlHandle) {
-      showToast('No SQL file loaded.', 'error');
-      return;
-    }
+    if (!requireSqlHandle()) return;
 
     try {
       const result = removeForeignKeyStatement(sqlContent, fk);
@@ -1806,10 +2032,7 @@
    * @param {boolean} currentlyPrimaryKey
    */
   async function handleTogglePrimaryKey(tableName, columnName, currentlyPrimaryKey) {
-    if (!sqlHandle) {
-      showToast('No SQL file loaded.', 'error');
-      return;
-    }
+    if (!requireSqlHandle()) return;
 
     try {
       const result = currentlyPrimaryKey
@@ -2025,6 +2248,7 @@
    * @param {string} qualifiedName
    */
   function handleDropTableRequest(qualifiedName) {
+    if (!requireSqlHandle()) return;
     tableToDelete = qualifiedName;
     showDropTableConfirm = true;
   }
@@ -2601,6 +2825,8 @@
     onLoad={handleLoad}
     onRefresh={handleRefresh}
     onSave={handleSave}
+    onShare={handleShare}
+    onSaveAsFiles={handleSaveAsFiles}
     onDiagramChange={handleDiagramChange}
     onLayout={handleLayoutRequest}
     onEdgeStyleChange={handleEdgeStyleChange}
@@ -2609,7 +2835,10 @@
     onDiagramSettings={handleDiagramSettings}
     {diagrams}
     selectedDiagramId={selectedDiagramId}
-    fileLoaded={!!diagramHandle}
+    {hasDiagram}
+    hasHandle={!!diagramHandle}
+    shareSupported={isShareSupported()}
+    {isSharedSession}
     {diagramFileName}
     {sqlFileName}
     {dbType}
@@ -2675,7 +2904,7 @@
         <MiniMap />
         <FlowInstanceCapture onCapture={(instance) => flowInstance = instance} />
       </SvelteFlow>
-      {#if !diagramHandle}
+      {#if !hasDiagram}
         <RecentProjects
           projects={recentProjects}
           highlightKey={pendingAutoOpenKey}
